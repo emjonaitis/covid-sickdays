@@ -1,0 +1,501 @@
+---
+title: "Modeling teacher outages"
+author: Erin Jonaitis
+output: pdf_document
+---
+  
+```{r setup, include=FALSE, message=FALSE, warning=FALSE}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(knitr)
+library(kableExtra)
+
+n_student <- 15
+n_room <- 17
+n_teacher <- 30
+n_day <- 90
+n_sim <- 100
+n_rate <- 5
+
+df <- data.frame(expand.grid(student=c(1:n_student), room=c(1:n_room), day=c(1:n_day), rate=c(1:n_rate), masked=c("required","optional","responsive"))) %>%
+  select(day, rate, masked, room, student) %>%
+  arrange(day, rate, masked, room, student)
+df_assignments <- data.frame(expand.grid(teacher=c(1:n_teacher), room=c(1:n_room)))
+
+teacher_outage.df <- data.frame(expand.grid(rate=c(1:n_rate), masked=c("required","optional","responsive"), sim=c(1:n_sim))) %>%
+                     mutate(n_days_ge_6_teachers_out = NA)
+
+```
+
+
+```{r setting_constants, echo=FALSE, message=FALSE, warning=FALSE}
+
+# Masked transmission prob estimated via Boutzoukas et al Feb 2022
+# Ratio of transmission in unmasked vs masked environments from Boutzoukas et al Mar 2022
+p_trans_masked <- .007
+p_trans_unmasked <- p_trans_masked/(1-.72)
+
+# Modify to reflect local incidence
+# Currently checking four weekly levels; divide by 7 for daily incidence; multiply by underascertainment factor
+underascertainment <- 5
+# If one third of cases are detected, and there's a lag between infection and infectiousness, back-calculate the
+#   probability of daily ascertaiment wihin the 7 days of infectiousness
+p_ascertainment <- 1/underascertainment
+incidence_rates <- underascertainment*c(50, 75, 100, 150, 200)/100000/7
+names(incidence_rates) <- c("50/100K/7d", "75/100K/7d", "100/100K/7d", "150/100K/7d", "200/100K/7d")
+masking_conditions <- c("required","optional","responsive")
+
+p_trans <- c(p_trans_masked, p_trans_unmasked, p_trans_unmasked)
+names(p_trans) <- c("required","optional","responsive")
+
+# Building in lag between cases. This was pretty short for omicron.
+inter_case_interval <- 3
+
+```
+
+## Introduction
+
+In March 2022, the CDC published a [science brief](https://www.cdc.gov/coronavirus/2019-ncov/science/science-briefs/indicators-monitoring-community-levels.html) describing the statistical rationale for their new community levels metric of SARS-CoV-2 transmission. In their analysis, several measures of COVID-related hospital burden were the outcomes of interest. The investigators used ROC curves to map these outcomes to several composite indicators that were candidates for community level definition. The indicator with the strongest average AUC across the outcomes of interest was selected to define community levels.
+
+Although hospital overburden is a key risk that COVID-19 presents on a societal level, it is not the only risk. Notably, the pandemic has massively disrupted K-12 schools. In the first year of the pandemic, this disruption came largely in the form of planned classroom closure, with some schools opting for fully-virtual education, and others offering hybrid education only. In its second year, the disruptions were more stochastic, with classrooms shuttering for brief periods when in-school spread made staffing impossible, especially during the Omicron surge. Although all K-12 students and staff can now be vaccinated, and the direct impact of disease on their health is therefore tolerable in a societal sense, the indirect impact of widespread illness on students' access to learning cannot be discounted.
+
+As schools began to reopen in fall 2020, it became possible to study the effectiveness of various mitigations for reducing in-school spread. An early study by [Lessler and colleagues](https://pubmed.ncbi.nlm.nih.gov/33927057/) demonstrated that although in-person schooling was associated with increased household risk of COVID-19, families whose schools had adopted a broad portfolio of mitigations were at no greater risk than those whose students remained at home. More recently, several studies have demonstrated that face masks in particular are associated with substantially reduced risk of in-school transmission ([Boutzokas et al. 2022a](https://publications.aap.org/pediatrics/article/doi/10.1542/peds.2022-056687/185379/School-Masking-Policies-and-Secondary-SARS-CoV-2); [Donovan et al. 2022](https://www.cdc.gov/mmwr/volumes/71/wr/mm7110e1.htm); [Budzyn et al. 2021](https://www.ncbi.nlm.nih.gov/pmc/articles/PMC8486393/)), and also reduce the need for students to quarantine ([Boutzoukas et al. 2022b](https://publications.aap.org/pediatrics/article/149/Supplement_2/e2021054268L/183309/Quarantine-Elimination-for-K-12-Students-With-Mask?searchresult=1)). However, following the CDC's changed emphasis on community levels, most schools have begun removing these mitigations, including masking, from their COVID-19 response plan. It remains to be seen whether these thresholds for adopting mitigations, which were optimized for preventing hospital overwhelm, will also suffice for preventing staffing shortages in schools.
+
+In this analysis, I simulated the effects of mask removal on in-school transmission of SARS-CoV-2 at various community incidence levels. In particular, I explored infections in teachers, with a focus on how many days of instruction featured high absenteeism, as such days present the greatest problem for schools, given a limited pool of substitute teachers. 
+
+# Methods
+
+## Simulation
+
+This report reflects a run of `r n_sim` simulations, considering $`r n_rate`$ (local observed incidence rates: `r paste(names(incidence_rates), sep="; ")`) $\times 3$ masking conditions (required, optional, responsive). We assume that 1 in `r underascertainment` infections are detected and become cases, which we assume affects equally the generation of infections (true incidence is treated as observed incidence $\times 5$ `r underascertainment`) and their detection in the school setting. In each run, I model a period of `r n_day` days. For convenience, I ignore holidays and weekends.
+
+## School structure
+
+I modeled a school with 255 students in cohorts of 15, and 30 teachers who each have contact with 2, 4, or 6 cohorts per day. Teacher-classroom pairings were generated once per simulation.
+
+## Susceptibility
+
+Teachers were assumed to be boosted and thus to have durable partial immunity against infection, which I modeled as a halved probability of transmission. Students were assumed to be ineligible for a booster and thus to have no immunity against infection to start with. A first infection was assumed to create durable partial immunity, further halving the rate of infection for the remainder of the period; however, this additional protection does not apply to subsequent infections.
+
+## Exposure
+
+I considered three exposure conditions: masking required; masking optional; and responsive masking, where any room in which an infection was detected on the prior day must mask for the next fourteen days. The probability of transmission between two contacts without immunity was `r p_trans_masked` in the required condition (Boutzoukas et al., 2022b). Since masks have recently been estimated to reduce the probability of in-school transmission by 72%, the probability of transmitting in the mask-optional context was `r p_trans_unmasked`. In the responsive condition, the probability of transmission depended on whether masks were in place in that room, i.e. whether another recent infection had been detected.
+
+## Infection
+
+On Day 1, student infection status is distributed as a Bernoulli RV, with p equal to the estimated prevalence (observed incidence $\times$ underascertainment $\times 10$). On Day 2 and following, incident student infections are distributed as a Bernoulli RV, with p equal to the sum of the estimated incidence (observed incidence $\times$ underascertainment) and the probability of transmission in their classroom, defined as $1-(1-p_{trans|mask.condition})^{n.infectious}$. We assume that infected students that have been detected are excluded from participation, and so only include in $n.infectious$ those who have not been detected. An infection was assumed to last for ten days. To model the lag in onward transmission, an infection was padded at the beginning by `r inter_case_interval` additional days, during which infected individuals were assumed to be neither infectious nor detectable. Detection was assumed to happen on the third day of infectiousness and was modeled as a Bernoulli RV with probability `r round(p_ascertainment, 3)`.
+
+For the purpose of this simulation, teacher onward transmission is not modeled: they are assumed to be susceptible, but not infectious.
+
+```{r run_simulation, include=FALSE, message=FALSE, warning=FALSE}
+set.seed(6021023)
+
+# current puzzle: trying to recast so that we save a data frame that includes rate and masking policy.
+# the loop right now does not stop and I think something is in the wrong order.
+# also, see if I can suppress warnings from summarize somehow.
+
+for (i in 1:n_sim) {
+  message(paste("\n\n\n*** Simulation", i, "***"))
+  # Each of 30 teachers has contact with a different number of classrooms each day ranging from 2-6
+  # This is generated once per sim
+  teacher_load <- sample(c(2, 4, 6), size=n_teacher, replace=TRUE)
+  teacher_df   <- data.frame(expand.grid(teacher=c(1:n_teacher), room=c(1:n_room), rate=c(1:n_rate), masked=c("required","optional","responsive"))) %>%
+                  group_by(teacher) %>%
+                  do({ t = .$teacher[1]
+                  link = sample(c(rep(1, teacher_load[t]), rep(0, (n_room-teacher_load[t]))), replace=FALSE) 
+                  data.frame(., link)}) %>%
+                  filter(link==1) %>%
+                  select(-link) %>%
+                  merge(select(df, room, day) %>% distinct()) %>%
+                  arrange(teacher, room, day) %>%
+                  mutate(teacher_susceptible=0.5)
+  # Looping through rates, policies, and days
+  for (r in 1:n_rate) {
+    message(paste("Rate", r))
+    students_rate <- filter(df, rate==r)
+    teachers_rate <- filter(teacher_df, rate==r)
+    incidence <- incidence_rates[r]
+    for (m in masking_conditions) {
+      message(paste("Masking", m))
+      students_rate_masked <- filter(students_rate, masked==m)
+      teachers_rate_masked <- filter(teachers_rate, masked==m)    
+      condition <- paste("sim", i, "rate", r, "mask", m)
+      for (w in 1:n_day) {
+        students_today <- filter(students_rate_masked, day==w)
+        teachers_today <- filter(teachers_rate_masked, day==w)
+        if (w==1) {
+        # On the first day, we generate cases only by what they bring into the classroom, 
+        # governed by prevalence (incidence x 10 day course)
+        # Since the majority of students are unboosted, assume the vaccine is not protecting much against infection.
+        # Assume uniform distribution on when in their illness they enter (day 1-day 10), and start a counter
+          students_today_out   <- students_today %>%
+                                  mutate(infected = rbinom(n=n(), size=1, prob=incidence*10),
+                                         counter = infected*round(runif(n=n(), min=1, max=10+inter_case_interval), 0),
+                                         masking_counter = 0,
+                                         infectious = infected*ifelse(counter <= 10, 1, 0),
+                                         new_infection = infectious,
+                                         detected_previously=0,
+                                         detected = infectious*ifelse(counter<=8, 1, 0)*rbinom(n(), size=1, prob=p_ascertainment),
+                                         susceptible=1) %>%
+                                  merge(group_by(., room) %>% 
+                                          summarize(any_infectious=max(infectious), n_infectious=length(infectious[infectious==1]),
+                                                    any_detected=max(detected), n_detected=length(detected[detected==1]),
+                                                    .groups="drop"))
+          # For teachers, who are boosted and have ~50% protection against infection, cut the incidence in half.
+          # Same assumptions on when in their illness they come in
+          # Since we are not modeling teacher transmission to each other, we don't compute whether the teacher is infectious
+          teachers_today_out <- merge(teachers_today, students_today_out) %>% 
+                                group_by(teacher, day, rate, masked) %>%
+                                summarize(teacher_susceptible = first(teacher_susceptible),
+                                          any_infectious = max(infectious),
+                                          n_infectious = length(infectious[infectious==1]),
+                                          .groups="drop") %>%
+                                mutate(teacher_infected = rbinom(n(), size=1, prob=teacher_susceptible*incidence*10),
+                                       teacher_counter=teacher_infected*round(runif(n=n(), min=1, max=10+inter_case_interval), 0),
+                                       masking_counter = 0,
+                                       teacher_infectious = teacher_infected*ifelse(teacher_counter <= 10, 1, 0),
+                                       new_teacher_infection = teacher_infectious,
+                                       teacher_detected_previously=0,
+                                       teacher_detected = teacher_infectious*ifelse(teacher_counter<=8, 1, 0)*rbinom(n(), size=1, prob=p_ascertainment)) %>%
+                                ungroup()
+          students_out <- select(students_today_out, student, room, day, rate, masked, infected, new_infection, counter, masking_counter, infectious, 
+                                 detected_previously, detected, susceptible, any_infectious, n_infectious, any_detected, n_detected)
+          teachers_out <- select(teachers_today_out, teacher, day, rate, masked, teacher_infected, new_teacher_infection, teacher_counter, teacher_infectious,
+                                 teacher_detected_previously, teacher_detected, teacher_susceptible)
+          cat(".")
+        }
+        else {
+          # For days 2 onward, keep the data from yesterday, as this will govern who is sick today
+          # Assume that we have a 1/3 probability of detecting the infectious
+          students_yesterday <- filter(students_out, day==w-1 & rate==r & masked==m) %>%
+                                select(-day) %>%
+                                rename(infected_yesterday=infected, 
+                                       counter_yesterday=counter,
+                                       infectious_yesterday=infectious,
+                                       detected_yesterday=detected,
+                                       susceptible_yesterday=susceptible,
+                                       any_infectious_yesterday=any_infectious,
+                                       n_infectious_yesterday=n_infectious,
+                                       any_detected_yesterday=any_detected,
+                                       n_detected_yesterday=n_detected) %>%
+                                mutate(detected_previously = ifelse(detected_previously==1 & counter_yesterday>1, 1, detected_yesterday))
+          # How likely a teacher will be to get sick will depend on the number of infected contacts in the prior day
+          # We track the number detected, too, as those should be removed from the classroom and will prompt masking,
+          #   which also reduces the probability of transmission
+          students_yesterday_by_room <- group_by(students_yesterday, room, rate, masked) %>% 
+                                        summarize(any_infectious_yesterday = first(any_infectious_yesterday),
+                                                  n_infectious_yesterday = first(n_infectious_yesterday),
+                                                  any_detected_yesterday=first(any_detected_yesterday),
+                                                  n_detected_yesterday = length(detected_yesterday[detected_yesterday==1]),
+                                                  masking_counter_yesterday = pmax(first(masking_counter), any_detected_yesterday*14),
+                                                  .groups="drop")
+          teachers_yesterday <- filter(teachers_out, day==w-1) %>%
+                                select(-day) %>%
+                                rename(teacher_infected_yesterday=teacher_infected,
+                                       teacher_counter_yesterday=teacher_counter,
+                                       teacher_infectious_yesterday=teacher_infectious,
+                                       teacher_detected_yesterday=teacher_detected,
+                                       teacher_susceptible_yesterday=teacher_susceptible) %>%
+                                mutate(teacher_detected_previously = ifelse(teacher_detected_previously==1 & teacher_counter_yesterday>1, 1, 
+                                                                            teacher_detected_yesterday))
+          students_today_out <- students_today %>%
+                                merge(students_yesterday) %>%
+                                merge(students_yesterday_by_room) %>%
+                                mutate(masking_counter = pmax(masking_counter_yesterday-1, 0),
+                                       infected = ifelse(counter_yesterday>1, 1, 
+                                                     ifelse(masking_counter_yesterday>0 & masked=="responsive",
+                                                            rbinom(n=n(), size=1, 
+                                                             prob=susceptible_yesterday*(incidence+(1-(1-p_trans[1])^(n_infectious_yesterday-n_detected_yesterday)))),
+                                                            rbinom(n=n(), size=1,
+                                                             prob=susceptible_yesterday*(incidence+(1-(1-p_trans[m])^(n_infectious_yesterday-n_detected_yesterday)))))),
+                                       counter = ifelse(infected_yesterday==1,
+                                                        pmax(counter_yesterday-1, 0),
+                                                        ifelse(infected==1, 10+inter_case_interval, 0)),
+                                       infectious = infected*ifelse(counter <= 10, 1, 0),
+                                       new_infection = ifelse(infectious==1 & infectious_yesterday==0, 1, 0),
+                                       detected = ifelse(infectious==1 & counter==8, rbinom(n(), size=1, prob=p_ascertainment), 0),
+                                       susceptible = ifelse(infected==1 & counter==0 & susceptible_yesterday==1, 
+                                                            susceptible_yesterday*0.5, 
+                                                            susceptible_yesterday)) %>%
+                          merge(group_by(., room) %>% 
+                                  summarize(any_infectious = max(infectious),
+                                            n_infectious = length(infectious[infectious==1]),
+                                            any_detected=max(detected), n_detected=length(detected[detected==1]),
+                                            .groups="drop")) 
+        teachers_today_out <- teachers_today %>%
+                              merge(teachers_yesterday) %>%
+                              merge(students_yesterday_by_room) %>%
+                              group_by(teacher, day, rate, masked) %>%
+                              summarize(teacher_susceptible_yesterday = first(teacher_susceptible_yesterday),
+                                        teacher_infected_yesterday = first(teacher_infected_yesterday),
+                                        teacher_infectious_yesterday = first(teacher_infectious_yesterday),
+                                        teacher_detected_yesterday=first(teacher_detected_yesterday),
+                                        teacher_detected_previously=first(teacher_detected_previously),
+                                        teacher_counter_yesterday = first(teacher_counter_yesterday),
+                                        any_detected_yesterday=max(any_detected_yesterday),
+                                        masking_counter_yesterday = first(masking_counter_yesterday),
+                                        n_infectious_yesterday = sum(n_infectious_yesterday),
+                                        n_detected_yesterday = sum(n_detected_yesterday),
+                                        .groups="drop") %>%
+                              mutate(teacher_infected = ifelse(teacher_counter_yesterday>0, 1,
+                                                           ifelse(masking_counter_yesterday>0 & masked=="responsive",
+                                                                  rbinom(n=n(), size=1, 
+                                                                     prob=teacher_susceptible_yesterday*(incidence + (1-(1-0.5*p_trans[1])^(n_infectious_yesterday-n_detected_yesterday)))),
+                                                                  rbinom(n=n(), size=1, 
+                                                                     prob=teacher_susceptible_yesterday*(incidence + (1-(1-0.5*p_trans[m])^(n_infectious_yesterday-n_detected_yesterday)))))),
+                                     teacher_counter = ifelse(teacher_infected_yesterday==1,
+                                                              pmax(teacher_counter_yesterday-1, 0),
+                                                              ifelse(teacher_infected==1, 10+inter_case_interval, 0)),
+                                     teacher_infectious = teacher_infected*ifelse(teacher_counter <= 10, 1, 0),
+                                     new_teacher_infection = ifelse(teacher_infectious==1 & teacher_infectious_yesterday==0, 1, 0),
+                                     teacher_detected = ifelse(teacher_infectious==1 & teacher_counter==8, rbinom(n(), size=1, prob=p_ascertainment), 0),
+                                     teacher_susceptible = ifelse(teacher_infected==1 & teacher_counter==0 & teacher_susceptible_yesterday >= 0.5,
+                                                                  teacher_susceptible_yesterday*0.5, teacher_susceptible_yesterday))
+        students_out <- select(students_today_out, student, room, day, rate, masked, infected, new_infection, counter, masking_counter, infectious, 
+                               detected, detected_previously, susceptible, any_infectious, n_infectious, any_detected, n_detected) %>%
+                        rbind(students_out, .)
+        teachers_out <- select(teachers_today_out, teacher, day, rate, masked, teacher_infected, new_teacher_infection, teacher_counter, 
+                               teacher_infectious, teacher_detected_previously, teacher_detected, teacher_susceptible) %>%
+                        rbind(teachers_out, .) 
+        cat(".")
+        if (w==n_day) {
+          cat("\n")
+          if (i==1) {
+            filenames <- paste0("sim",i,"_rate",r,"_",m,"_", c("students","teachers"),".csv")
+            write.csv(students_out, filenames[1], row.names=FALSE)
+            write.csv(teachers_out, filenames[2], row.names=FALSE)
+          }
+        }
+        }
+      }
+      students_by_day <- group_by(students_out, day) %>% 
+                         summarize(N_infectious=sum(infectious), 
+                                   N_detected=sum(detected),
+                                   N_detected_previously = sum(detected_previously),
+                                   N_known_infections = sum(detected) + sum(detected_previously),
+                                   N_new_infections = sum(new_infection),
+                                   .groups="drop") %>%
+                         mutate(week=ceiling(day/7))
+      students_by_week <- group_by(students_by_day, week) %>%
+                          summarize(N_infected_weekly = sum(N_new_infections),
+                                    N_detected_weekly=sum(N_detected),
+                                    .groups="drop")
+      teachers_by_day <- group_by(teachers_out, day) %>% 
+                         summarize(N_teachers_infectious=sum(teacher_infectious),
+                                   N_teachers_detected=sum(teacher_detected),
+                                   N_known_teacher_infections = sum(teacher_detected) + sum(teacher_detected_previously),
+                                   N_new_teacher_infections = sum(new_teacher_infection),
+                                   .groups="drop") %>% 
+                         mutate(week=ceiling(day/7))
+      teachers_by_week <- group_by(teachers_by_day, week) %>%
+                          summarize(N_teachers_infected_weekly=sum(N_new_teacher_infections),
+                                    N_teachers_detected_weekly=sum(N_teachers_detected),
+                                    .groups="drop")
+      
+      teacher_outage.df$n_days_ge_6_teachers_infected[teacher_outage.df$rate==r & teacher_outage.df$masked==m & teacher_outage.df$sim==i] <- filter(teachers_by_day, N_teachers_infectious>5) %>% nrow()
+      teacher_outage.df$n_days_ge_6_teachers_out[teacher_outage.df$rate==r & teacher_outage.df$masked==m & teacher_outage.df$sim==i] <- filter(teachers_by_day, N_known_teacher_infections>5) %>% nrow()
+      teacher_outage.df$highest_n_teachers_infected[teacher_outage.df$rate==r & teacher_outage.df$masked==m & teacher_outage.df$sim==i] <- max(teachers_by_day$N_teachers_infectious)
+      teacher_outage.df$highest_n_teachers_out[teacher_outage.df$rate==r & teacher_outage.df$masked==m & teacher_outage.df$sim==i] <- max(teachers_by_day$N_known_teacher_infections)
+      teacher_outage.df$n_days_ge_26_students_infected[teacher_outage.df$rate==r & teacher_outage.df$masked==m & teacher_outage.df$sim==i] <- filter(students_by_day, N_infectious>25) %>% nrow()
+      teacher_outage.df$n_days_ge_26_students_out[teacher_outage.df$rate==r & teacher_outage.df$masked==m & teacher_outage.df$sim==i] <- filter(students_by_day, N_known_infections>25) %>% nrow()
+      teacher_outage.df$highest_n_students_infected[teacher_outage.df$rate==r & teacher_outage.df$masked==m & teacher_outage.df$sim==i] <- max(students_by_day$N_infectious)
+      teacher_outage.df$highest_n_students_out[teacher_outage.df$rate==r & teacher_outage.df$masked==m & teacher_outage.df$sim==i] <- max(students_by_day$N_known_infections)
+      teacher_outage.df$average_weekly_teachers_infected[teacher_outage.df$rate==r & teacher_outage.df$masked==m & teacher_outage.df$sim==i] <- mean(teachers_by_week$N_teachers_infected_weekly)
+      teacher_outage.df$average_weekly_teachers_detected[teacher_outage.df$rate==r & teacher_outage.df$masked==m & teacher_outage.df$sim==i] <- mean(teachers_by_week$N_teachers_detected_weekly)
+      teacher_outage.df$average_weekly_students_infected[teacher_outage.df$rate==r & teacher_outage.df$masked==m & teacher_outage.df$sim==i] <- mean(students_by_week$N_infected_weekly)
+      teacher_outage.df$average_weekly_students_detected[teacher_outage.df$rate==r & teacher_outage.df$masked==m & teacher_outage.df$sim==i] <- mean(students_by_week$N_detected_weekly)
+
+      # For plotting
+      if (r==1 & m=="required") {
+        students_all <- students_out
+        teachers_all <- teachers_out
+      } else {
+        students_all <- rbind(students_all, students_out)
+        teachers_all <- rbind(teachers_all, teachers_out)
+      }
+    }
+    # summary_by_day_and_room  <- group_by(df.out, day, room) %>%
+    #   summarize(n_infected = length(infected[infected==1]),
+    #             teacher_infected = first(teacher_infected))
+    # #ggplot(summary_by_day_and_room, aes(x=day, y=n_infected, group=room)) + geom_line()
+    # 
+    # # Plotting the number of teachers infected, over three months.
+  }
+  students_all_by_day <- group_by(students_all, day, rate, masked) %>% 
+                         summarize(N_students_infectious=sum(infectious), 
+                                   N_known_infections = sum(detected) + sum(detected_previously),
+                                   N_new_infections = sum(new_infection))
+  teachers_all_by_day <- group_by(teachers_all, day, rate, masked) %>% 
+                         summarize(N_teachers_infectious=sum(teacher_infectious), 
+                                   N_known_teacher_infections = sum(teacher_detected) + sum(teacher_detected_previously),
+                                   N_new_teacher_infections = sum(new_teacher_infection))
+  if (i==1) {
+    students_all_plot <- ggplot(df) +
+                         facet_grid(rows=vars(factor(masked,
+                                                      levels=c("required","optional","responsive"),
+                                                      labels=c("Masks\nrequired","Masks\noptional","Responsive\nmasking"))),
+                              cols=vars(factor(rate, levels=c(1:5), labels=names(incidence_rates)))) +
+                         labs(x="Day", y="Number of students infected") +
+                         theme_bw()
+    students_all_known_plot <- ggplot(df) +
+                               facet_grid(rows=vars(factor(masked,
+                                                            levels=c("required","optional","responsive"),
+                                                            labels=c("Masks\nrequired","Masks\noptional","Responsive\nmasking"))),
+                                    cols=vars(factor(rate, levels=c(1:5), labels=names(incidence_rates)))) +
+                               labs(x="Day", y="Number of students infected") +
+                               theme_bw()
+    teachers_all_plot <- ggplot(df) + 
+                         facet_grid(rows=vars(factor(masked,
+                                              levels=c("required","optional","responsive"),
+                                              labels=c("Masks\nrequired","Masks\noptional","Responsive\nmasking"))), 
+                              cols=vars(factor(rate, levels=c(1:5), labels=names(incidence_rates)))) +
+                         labs(x="Day", y="Number of teachers infected") +
+                         theme_bw()
+    teachers_all_known_plot <- ggplot(df) + 
+                               facet_grid(rows=vars(factor(masked,
+                                                    levels=c("required","optional","responsive"),
+                                                    labels=c("Masks\nrequired","Masks\noptional","Responsive\nmasking"))), 
+                                    cols=vars(factor(rate, levels=c(1:5), labels=names(incidence_rates)))) +
+                               labs(x="Day", y="Number of teachers infected") +
+                               theme_bw()
+  } 
+  students_all_plot <- students_all_plot + geom_line(data=students_all_by_day, aes(x=day, y=N_students_infectious), alpha=0.1) 
+  students_all_known_plot <- students_all_known_plot + geom_line(data=students_all_by_day, aes(x=day, y=N_known_infections), alpha=0.1) 
+  teachers_all_plot <- teachers_all_plot + geom_line(data=teachers_all_by_day, aes(x=day, y=N_teachers_infectious), alpha=0.1) 
+  teachers_all_known_plot <- teachers_all_known_plot + geom_line(data=teachers_all_by_day, aes(x=day, y=N_known_teacher_infections), alpha=0.1) 
+  if (i==n_sim) {
+    ggsave("./students_all_plot.png", students_all_plot, width=12, height=8, units="in")
+    ggsave("./students_all_known_plot.png", students_all_known_plot, width=12, height=8, units="in")
+    ggsave("./teachers_all_plot.png", teachers_all_plot, width=12, height=8, units="in")
+    ggsave("./teachers_all__known_plot.png", teachers_all_known_plot, width=12, height=8, units="in")
+  }
+  write.csv(teacher_outage.df, "/Users/jonaitis/Documents/Family/Hazel/EAGLE/covid/teacher_outage_20220406.csv", row.names=FALSE)
+}
+```
+
+# Results
+
+## Outage by day
+
+Here are two plots of student infections by day in each of the ten conditions. Each thin line reflects one simulation. The upper plot reflects all infections; the lower plot reflects infections that have been detected and are still active (which should map well onto student absences).
+
+```{r students_all_by_day_plot, echo=FALSE, message=FALSE, warning=FALSE}
+students_all_plot
+
+students_all_known_plot
+```
+
+And here is a similar pair of plots for teachers.
+
+```{r teachers_all_by_day_plot, echo=FALSE, message=FALSE, warning=FALSE}
+teachers_all_plot
+
+teachers_all_known_plot
+```
+
+## Maximum number of teachers out on any given day
+
+One measure of institutional burden is: what is the most teachers that were out on any given day during the period covered by the simulation? This should reflect all active teacher infections that have been detected.
+
+Below is a histogram that plots this value for the `r n_sim` runs of our simulation, across the rates and masking conditions that we modeled. We might think of the peak of this distribution as representing a "typical worst case scenario": that is, in 90 days under this set of conditions, what's the worst outage day that you're likely to see?
+
+```{r plot_results, echo=FALSE, message=FALSE, warning=FALSE}
+# Plotting the distribution, across simulations, of how many days 6 or more teachers are out.
+ggplot(teacher_outage.df, aes(x=highest_n_teachers_out)) + 
+  geom_histogram() + 
+  facet_grid(rows=vars(factor(masked,
+                              levels=c("required","optional","responsive"),
+                              labels=c("Masks\nrequired","Masks\noptional","Responsive\nmasking"))),
+             cols=vars(factor(rate, levels=c(1:5), labels=names(incidence_rates)))) + 
+  theme_bw()
+```
+
+## Summary table of several outcomes across simulations
+
+In this table, we look at four types of outcomes, each considered with respect to all infections, and then only those infections that are detected. We consider these separately because they represent different aspects of burden: all infections reflect health and transmission risk, whereas detected infections are the ones that will affect absenteeism. The types of outcomes are:
+
+- Average weekly incidence of infection or detection: This represents the typical weekly burden, averaged over weeks of the simulation, and then over simulations.
+- Median worst incidence: For this we took the highest observed incidence of infection or detection over all weeks in a given simulation, and then calculated the median value across simulations. This might give us a sense of a "typical worst case scenario" we'd expect to encounter, in terms of infections or absences.
+- Percentage of the time that some threshold is crossed: We set thresholds of interest for each group. For students, we selected 26 infections as the threshold, approximately 10% of the student body. For teachers, this threshold was six teachers, as six absences was determined a priori to represent a risk of school disruption. To calculate this, we determined for each simulation whether there was at least one day on which either infections or detections exceeded the threshold, and then computed the fraction of simulations in which this occured.
+- Median number of days on which the threshold was exceeded: Using the same thresholds as above, we counted the total number of days in each simulation on which the threshold was crossed, and calculated the median value across simulations. This is a way to gauge how long-lasting such disruptions might be.
+
+### Student infections and absences
+
+```{r table_students, echo=FALSE, message=FALSE, warning=FALSE, out="asis"}
+student_outage.tab  <- mutate(teacher_outage.df,
+                              rate.f = factor(rate, levels=c(1:5), labels=names(incidence_rates)),
+                              masked.f = factor(masked,
+                                                levels=c("required","optional","responsive"),
+                                                labels=c("Required","Optional","Responsive"))) %>%
+                       group_by(rate.f, masked.f) %>%
+                       summarize(average_weekly_students_infected = round(mean(average_weekly_students_infected), 2),
+                                 average_weekly_students_detected = round(mean(average_weekly_students_detected), 2),
+                                 median_worst_infections = median(highest_n_students_infected),
+                                 median_worst_outage = median(highest_n_students_out),
+                                 prop_any_days_ge_26_inf = length(n_days_ge_26_students_infected[n_days_ge_26_students_infected>0])/length(n_days_ge_26_students_infected),
+                                 prop_any_days_ge_26 = length(n_days_ge_26_students_out[n_days_ge_26_students_out>0])/length(n_days_ge_26_students_out),
+                                 median_days_ge_26_inf = median(n_days_ge_26_students_infected),
+                                 median_days_ge_26 = median(n_days_ge_26_students_out)) %>%
+                       ungroup() %>%
+                       pivot_longer(cols=average_weekly_students_infected:median_days_ge_26,
+                                    names_to="metric",
+                                    values_to="value") %>%
+                       mutate(metric.f = factor(metric,
+                                                levels=c("average_weekly_students_infected", "average_weekly_students_detected",
+                                                         "median_worst_infections", "median_worst_outage",
+                                                         "prop_any_days_ge_26_inf", "prop_any_days_ge_26",
+                                                         "median_days_ge_26_inf", "median_days_ge_26"))) %>%
+                       #### Stuck on how to format column headers. These are not rendering right
+                       select(masked.f, rate.f, metric.f, value) %>%
+                       arrange(masked.f, rate.f) %>%
+                       pivot_wider(id_cols=c("masked.f","rate.f"), names_from="metric.f", values_from="value", values_fill=0) %>%
+                       mutate(pct_any_days_ge_26_inf = paste0(100*round(prop_any_days_ge_26_inf,2), "%"),
+                              pct_any_days_ge_26 = paste0(100*round(prop_any_days_ge_26,2), "%")) %>%
+                       select(masked.f, rate.f, average_weekly_students_infected, average_weekly_students_detected,
+                              median_worst_infections, median_worst_outage, pct_any_days_ge_26_inf, pct_any_days_ge_26, median_days_ge_26_inf, median_days_ge_26)
+kable(student_outage.tab, 
+      col.names=c("Masks","Rate","I/wk", "C/wk", "Max(I)", "Max(C)",
+                   "I>=6", "C>=6", "D(I>=6)", "D(C>=6"))
+
+```
+
+### Teacher infections and absences
+
+```{r table_teachers, echo=FALSE, message=FALSE, warning=FALSE, out="asis"}
+teacher_outage.tab  <- mutate(teacher_outage.df,
+                              rate.f = factor(rate, levels=c(1:5), labels=names(incidence_rates)),
+                              masked.f = factor(masked,
+                                                levels=c("required","optional","responsive"),
+                                                labels=c("Required","Optional","Responsive"))) %>%
+                       group_by(rate.f, masked.f) %>%
+                       summarize(average_weekly_teachers_infected = round(mean(average_weekly_teachers_infected), 2),
+                                 average_weekly_teachers_detected = round(mean(average_weekly_teachers_detected), 2),
+                                 median_worst_infections = median(highest_n_teachers_infected),
+                                 median_worst_outage = median(highest_n_teachers_out),
+                                 prop_any_days_ge_6_inf = length(n_days_ge_6_teachers_infected[n_days_ge_6_teachers_infected>0])/length(n_days_ge_6_teachers_infected),
+                                 prop_any_days_ge_6 = length(n_days_ge_6_teachers_out[n_days_ge_6_teachers_out>0])/length(n_days_ge_6_teachers_out),
+                                 median_days_ge_6_inf = median(n_days_ge_6_teachers_infected),
+                                 median_days_ge_6 = median(n_days_ge_6_teachers_out)) %>%
+                       ungroup() %>%
+                       pivot_longer(cols=average_weekly_teachers_infected:median_days_ge_6,
+                                    names_to="metric",
+                                    values_to="value") %>%
+                       mutate(metric.f = factor(metric,
+                                                levels=c("average_weekly_teachers_infected", "average_weekly_teachers_detected",
+                                                         "median_worst_infections", "median_worst_outage",
+                                                         "prop_any_days_ge_6_inf", "prop_any_days_ge_6",
+                                                         "median_days_ge_6_inf", "median_days_ge_6"))) %>%
+                       #### Stuck on how to format column headers. These are not rendering right
+                       select(masked.f, rate.f, metric.f, value) %>%
+                       arrange(masked.f, rate.f) %>%
+                       pivot_wider(id_cols=c("masked.f","rate.f"), names_from="metric.f", values_from="value", values_fill=0) %>%
+                       mutate(pct_any_days_ge_6_inf = paste0(100*round(prop_any_days_ge_6_inf,2), "%"),
+                              pct_any_days_ge_6 = paste0(100*round(prop_any_days_ge_6,2), "%")) %>%
+                       select(masked.f, rate.f, average_weekly_teachers_infected, average_weekly_teachers_detected,
+                              median_worst_infections, median_worst_outage, pct_any_days_ge_6_inf, pct_any_days_ge_6, median_days_ge_6_inf, median_days_ge_6)
+kable(teacher_outage.tab, 
+      col.names=c("Masks","Rate","I/wk", "C/wk", "Max(I)", "Max(C)",
+                   "I>=6", "C>=6", "D(I>=6)", "D(C>=6"))
+
+```
